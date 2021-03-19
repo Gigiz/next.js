@@ -103,12 +103,6 @@ function linkClicked(
     shallow,
     locale,
     scroll,
-  }).then((success: boolean) => {
-    if (!success) return
-    if (scroll) {
-      // FIXME: proper route announcing at Router level, not Link:
-      document.body.focus()
-    }
   })
 }
 
@@ -301,12 +295,17 @@ function Link(props: React.PropsWithChildren<LinkProps>) {
     const curLocale =
       typeof locale !== 'undefined' ? locale : router && router.locale
 
-    const localeDomain = getDomainLocale(
-      as,
-      curLocale,
-      router && router.locales,
-      router && router.domainLocales
-    )
+    // we only render domain locales if we are currently on a domain locale
+    // so that locale links are still visitable in development/preview envs
+    const localeDomain =
+      router &&
+      router.isLocaleDomain &&
+      getDomainLocale(
+        as,
+        curLocale,
+        router && router.locales,
+        router && router.domainLocales
+      )
 
     childProps.href =
       localeDomain ||
