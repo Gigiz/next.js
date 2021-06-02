@@ -176,6 +176,7 @@ const WEBPACK_RESOLVE_OPTIONS = {
   // Otherwise combined ESM+CJS packages will never be external
   // as resolving mismatch would lead to opt-out from being external.
   dependencyType: 'commonjs',
+  symlinks: true,
 }
 
 const NODE_RESOLVE_OPTIONS = {
@@ -233,10 +234,11 @@ export default async function getBaseWebpackConfig(
   const reactVersion = await getPackageVersion({ cwd: dir, name: 'react' })
   const hasReactRefresh: boolean = dev && !isServer
   const hasJsxRuntime: boolean =
-    Boolean(reactVersion) &&
-    // 17.0.0-rc.0 had a breaking change not compatible with Next.js, but was
-    // fixed in rc.1.
-    semver.gte(reactVersion!, '17.0.0-rc.1')
+    config.experimental.reactRoot ||
+    (Boolean(reactVersion) &&
+      // 17.0.0-rc.0 had a breaking change not compatible with Next.js, but was
+      // fixed in rc.1.
+      semver.gte(reactVersion!, '17.0.0-rc.1'))
 
   const babelConfigFile = await [
     '.babelrc',
@@ -258,7 +260,9 @@ export default async function getBaseWebpackConfig(
 
   const distDir = path.join(dir, config.distDir)
 
-  const babelLoader = config.experimental.turboMode
+  // Webpack 5 can use the faster babel loader, webpack 5 has built-in caching for loaders
+  // For webpack 4 the old loader is used as it has external caching
+  const babelLoader = isWebpack5
     ? require.resolve('./babel/loader/index')
     : 'next-babel-loader'
   const defaultLoaders = {
@@ -503,7 +507,7 @@ export default async function getBaseWebpackConfig(
       // and all other chunk depend on them so there is no
       // duplication that need to be pulled out.
       chunks: isWebpack5
-        ? (chunk) => !/^(main|pages\/_app)$/.test(chunk.name)
+        ? (chunk) => !/^(polyfills|main|pages\/_app)$/.test(chunk.name)
         : 'all',
       cacheGroups: {
         framework: {
@@ -739,6 +743,14 @@ export default async function getBaseWebpackConfig(
       return
     }
 
+    if (
+      res.match(
+        /next[/\\]dist[/\\]next-server[/\\](?!lib[/\\]router[/\\]router)/
+      )
+    ) {
+      return `commonjs ${request}`
+    }
+
     // Default pages have to be transpiled
     if (
       res.match(/[/\\]next[/\\]dist[/\\]/) ||
@@ -822,7 +834,18 @@ export default async function getBaseWebpackConfig(
       ...(isWebpack5 ? { emitOnErrors: !dev } : { noEmitOnErrors: dev }),
       checkWasmTypes: false,
       nodeEnv: false,
-      splitChunks: isServer ? false : splitChunksConfig,
+      splitChunks: isServer
+        ? isWebpack5
+          ? ({
+              filename: '[name].js',
+              // allow to split entrypoints
+              chunks: 'all',
+              // size of files is not so relevant for server build
+              // we want to prefer deduplication to load less code
+              minSize: 1000,
+            } as any)
+          : false
+        : splitChunksConfig,
       runtimeChunk: isServer
         ? isWebpack5 && !isLikeServerless
           ? { name: 'webpack-runtime' }
@@ -898,17 +921,20 @@ export default async function getBaseWebpackConfig(
             },
           }
         : {}),
+      // we must set publicPath to an empty value to override the default of
+      // auto which doesn't work in IE11
+      publicPath: '',
       path:
         isServer && isWebpack5 && !dev
           ? path.join(outputPath, 'chunks')
           : outputPath,
-      // On the server we don't use the chunkhash
+      // On the server we don't use hashes
       filename: isServer
         ? isWebpack5 && !dev
           ? '../[name].js'
           : '[name].js'
         : `static/chunks/${isDevFallback ? 'fallback/' : ''}[name]${
-            dev ? '' : '-[chunkhash]'
+            dev ? '' : isWebpack5 ? '-[contenthash]' : '-[chunkhash]'
           }.js`,
       library: isServer ? undefined : '_N_E',
       libraryTarget: isServer ? 'commonjs2' : 'assign',
@@ -920,7 +946,7 @@ export default async function getBaseWebpackConfig(
         : 'static/webpack/[hash].hot-update.json',
       // This saves chunks with the name given via `import()`
       chunkFilename: isServer
-        ? `${dev ? '[name]' : '[name].[contenthash]'}.js`
+        ? '[name].js'
         : `static/chunks/${isDevFallback ? 'fallback/' : ''}${
             dev ? '[name]' : '[name].[contenthash]'
           }.js`,
@@ -1236,6 +1262,47 @@ export default async function getBaseWebpackConfig(
     // webpack 5 no longer polyfills Node.js modules:
     if (webpackConfig.node) delete webpackConfig.node.setImmediate
 
+    // Due to bundling of webpack the default values can't be correctly detected
+    // This restores the webpack defaults
+    // @ts-ignore webpack 5
+    webpackConfig.snapshot = {}
+    if (process.versions.pnp === '3') {
+      const match = /^(.+?)[\\/]cache[\\/]jest-worker-npm-[^\\/]+\.zip[\\/]node_modules[\\/]/.exec(
+        require.resolve('jest-worker')
+      )
+      if (match) {
+        // @ts-ignore webpack 5
+        webpackConfig.snapshot.managedPaths = [
+          path.resolve(match[1], 'unplugged'),
+        ]
+      }
+    } else {
+      const match = /^(.+?[\\/]node_modules)[\\/]/.exec(
+        require.resolve('jest-worker')
+      )
+      if (match) {
+        // @ts-ignore webpack 5
+        webpackConfig.snapshot.managedPaths = [match[1]]
+      }
+    }
+    if (process.versions.pnp === '1') {
+      const match = /^(.+?[\\/]v4)[\\/]npm-jest-worker-[^\\/]+-[\da-f]{40}[\\/]node_modules[\\/]/.exec(
+        require.resolve('jest-worker')
+      )
+      if (match) {
+        // @ts-ignore webpack 5
+        webpackConfig.snapshot.immutablePaths = [match[1]]
+      }
+    } else if (process.versions.pnp === '3') {
+      const match = /^(.+?)[\\/]jest-worker-npm-[^\\/]+\.zip[\\/]node_modules[\\/]/.exec(
+        require.resolve('jest-worker')
+      )
+      if (match) {
+        // @ts-ignore webpack 5
+        webpackConfig.snapshot.immutablePaths = [match[1]]
+      }
+    }
+
     if (dev) {
       if (!webpackConfig.optimization) {
         webpackConfig.optimization = {}
@@ -1260,6 +1327,7 @@ export default async function getBaseWebpackConfig(
       pageEnv: config.experimental.pageEnv,
       excludeDefaultMomentLocales: config.future.excludeDefaultMomentLocales,
       assetPrefix: config.assetPrefix,
+      disableOptimizedLoading: config.experimental.disableOptimizedLoading,
       target,
       reactProductionProfiling,
       webpack: !!config.webpack,
@@ -1283,9 +1351,6 @@ export default async function getBaseWebpackConfig(
     }
 
     webpackConfig.cache = cache
-
-    // @ts-ignore TODO: remove ignore when webpack 5 is stable
-    webpackConfig.optimization.realContentHash = false
 
     if (process.env.NEXT_WEBPACK_LOGGING) {
       const logInfra = process.env.NEXT_WEBPACK_LOGGING.includes(
@@ -1624,7 +1689,12 @@ export default async function getBaseWebpackConfig(
 
       if (isWebpack5 && !isServer) {
         for (const name of Object.keys(entry)) {
-          if (name === 'main' || name === 'amp' || name === 'react-refresh')
+          if (
+            name === 'polyfills' ||
+            name === 'main' ||
+            name === 'amp' ||
+            name === 'react-refresh'
+          )
             continue
           const dependOn =
             name.startsWith('pages/') && name !== 'pages/_app'
